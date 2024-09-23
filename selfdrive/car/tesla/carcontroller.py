@@ -1,66 +1,123 @@
-from openpilot.common.numpy_fast import clip
+from selfdrive.car.tesla.teslacan import TeslaCAN
+
+from selfdrive.car.tesla.HUD_module import HUDController
+from selfdrive.car.tesla.LONG_module import LONGController
+from selfdrive.car.modules.CFG_module import load_bool_param
 from opendbc.can.packer import CANPacker
-from openpilot.selfdrive.car import apply_std_steer_angle_limits
-from openpilot.selfdrive.car.interfaces import CarControllerBase
-from openpilot.selfdrive.car.tesla.teslacan import TeslaCAN
-from openpilot.selfdrive.car.tesla.values import DBC, CANBUS, CarControllerParams
+from selfdrive.car.tesla.values import DBC, CAR, CarControllerParams, CAN_CHASSIS, CAN_AUTOPILOT, CAN_EPAS, CruiseButtons
+import cereal.messaging as messaging
+from common.numpy_fast import clip, interp
 
 
-class CarController(CarControllerBase):
+class CarController():
   def __init__(self, dbc_name, CP, VM):
-    super().__init__(dbc_name, CP, VM)
-    self.apply_angle_last = 0
+    self.CP = CP
+    self.last_angle = 0
     self.packer = CANPacker(dbc_name)
-    self.pt_packer = CANPacker(DBC[CP.carFingerprint]['pt'])
-    self.tesla_can = TeslaCAN(self.packer, self.pt_packer)
+    self.pt_packer = None
+    if DBC[CP.carFingerprint]['pt']:
+      self.pt_packer = CANPacker(DBC[CP.carFingerprint]['pt'])
+    self.tesla_can = TeslaCAN(dbc_name, self.packer, self.pt_packer)
+    self.prev_das_steeringControl_counter = -1
+    self.long_control_counter = 0
 
-  def update(self, CC, CS, now_nanos):
-    actuators = CC.actuators
-    pcm_cancel_cmd = CC.cruiseControl.cancel
+    #initialize modules
+    
+    self.hud_controller = HUDController(CP,self.packer,self.tesla_can)
+    pedalcan = 2
+    if load_bool_param("TinklaPedalCanZero", False):
+      pedalcan = 0
+    self.long_controller = LONGController(CP,self.packer,self.tesla_can,pedalcan)
 
+
+    self.cruiseDelayFrame = 0
+    self.prevCruiseEnabled = False
+
+    self.lP = messaging.sub_sock('longitudinalPlan') 
+    self.rS = messaging.sub_sock('radarState') 
+    self.mD = messaging.sub_sock('modelV2')
+    self.cS = messaging.sub_sock('controlsState')
+
+    self.long_control_counter = 0 
+    
+  
+  #def update(self, c, enabled, CS, frame, actuators, cruise_cancel):
+  def update(self, c, enabled, CS, frame, actuators, cruise_cancel, pcm_speed, pcm_override, hud_alert, audible_alert,
+             left_line, right_line, lead, left_lane_depart, right_lane_depart): 
+    if frame % 100 == 0:
+      CS.autoresumeAcc = load_bool_param("TinklaAutoResumeACC",False)
     can_sends = []
-
-    # Temp disable steering on a hands_on_fault, and allow for user override
-    hands_on_fault = CS.steer_warning == "EAC_ERROR_HANDS_ON" and CS.hands_on_level >= 3
-    lkas_enabled = CC.latActive and not hands_on_fault
-
-    if self.frame % 2 == 0:
-      if lkas_enabled:
-        # Angular rate limit based on speed
-        apply_angle = apply_std_steer_angle_limits(actuators.steeringAngleDeg, self.apply_angle_last, CS.out.vEgo, CarControllerParams)
-
-        # To not fault the EPS
-        apply_angle = clip(apply_angle, CS.out.steeringAngleDeg - 20, CS.out.steeringAngleDeg + 20)
+    #add 1 second delay logic to wait for AP which has a status at 2Hz
+    if self.CP.carFingerprint != CAR.PREAP_MODELS and not CS.autopilot_disabled:
+      if CS.cruiseEnabled:
+        if not self.prevCruiseEnabled:
+          self.cruiseDelayFrame = frame
+        if frame - self.cruiseDelayFrame > 30:
+          CS.cruiseDelay = True
       else:
-        apply_angle = CS.out.steeringAngleDeg
+        self.cruiseDelayFrame = 0
+        CS.cruiseDelay = False
+    self.prevCruiseEnabled = CS.cruiseEnabled
 
-      self.apply_angle_last = apply_angle
-      can_sends.append(self.tesla_can.create_steering_control(apply_angle, lkas_enabled, (self.frame // 2) % 16))
+    #receive socks
+    long_plan = messaging.recv_one_or_none(self.lP)
+    radar_state = messaging.recv_one_or_none(self.rS)
+    model_data = messaging.recv_one_or_none(self.mD)
+    controls_state = messaging.recv_one_or_none(self.cS)
 
-    # Longitudinal control (in sync with stock message, about 40Hz)
-    if self.CP.openpilotLongitudinalControl:
-      target_accel = actuators.accel
-      target_speed = max(CS.out.vEgo + (target_accel * CarControllerParams.ACCEL_TO_SPEED_MULTIPLIER), 0)
-      max_accel = 0 if target_accel < 0 else target_accel
-      min_accel = 0 if target_accel > 0 else target_accel
+    if not enabled:
+      self.v_target = CS.out.vEgo
+      self.a_target = 1
 
-      while len(CS.das_control_counters) > 0:
-        can_sends.extend(self.tesla_can.create_longitudinal_commands(CS.acc_state, target_speed, min_accel, max_accel, CS.das_control_counters.popleft()))
+    # Cancel when openpilot is not enabled anymore and no autopilot
+    # BB: do we need to do this? AP/Tesla does not behave this way
+    #   LKAS can be disabled by steering and ACC remains engaged
+    #TODO: we need more logic arround this for AP0
+    if not enabled and bool(CS.out.cruiseState.enabled) and not CS.enableHumanLongControl:
+      cruise_cancel = True
 
-    # Cancel on user steering override, since there is no steering torque blending
-    if hands_on_fault:
-      pcm_cancel_cmd = True
+    if ((frame % 10) == 0 and cruise_cancel):
+      stlk_counter = ((CS.msg_stw_actn_req['MC_STW_ACTN_RQ'] + 1) % 16)
+      can_sends.insert(0,self.tesla_can.create_action_request(CS.msg_stw_actn_req, CruiseButtons.CANCEL, CAN_CHASSIS[self.CP.carFingerprint],stlk_counter))
+      if (self.CP.carFingerprint in [CAR.AP1_MODELS,CAR.AP2_MODELS]):
+        can_sends.insert(1,self.tesla_can.create_action_request(CS.msg_stw_actn_req, CruiseButtons.CANCEL, CAN_AUTOPILOT[self.CP.carFingerprint],stlk_counter))
 
-    if self.frame % 10 == 0 and pcm_cancel_cmd:
-      # Spam every possible counter value, otherwise it might not be accepted
-      for counter in range(16):
-        can_sends.append(self.tesla_can.create_action_request(CS.msg_stw_actn_req, pcm_cancel_cmd, CANBUS.chassis, counter))
-        can_sends.append(self.tesla_can.create_action_request(CS.msg_stw_actn_req, pcm_cancel_cmd, CANBUS.autopilot_chassis, counter))
+    #now process controls
+    if enabled and not CS.human_control:
+      apply_angle = actuators.steeringAngleDeg
 
-    # TODO: HUD control
+      # Angular rate limit based on speed
+      steer_up = (self.last_angle * apply_angle > 0. and abs(apply_angle) > abs(self.last_angle))
+      rate_limit = CarControllerParams.RATE_LIMIT_UP if steer_up else CarControllerParams.RATE_LIMIT_DOWN
+      max_angle_diff = interp(CS.out.vEgo, rate_limit.speed_points, rate_limit.max_angle_diff_points)
+      apply_angle = clip(apply_angle, (self.last_angle - max_angle_diff), (self.last_angle + max_angle_diff))
 
-    new_actuators = actuators.as_builder()
-    new_actuators.steeringAngleDeg = self.apply_angle_last
+      # To not fault the EPS
+      apply_angle = clip(apply_angle, (CS.out.steeringAngleDeg - 20), (CS.out.steeringAngleDeg + 20))
+    else:
+      apply_angle = CS.out.steeringAngleDeg
 
-    self.frame += 1
+    self.last_angle = apply_angle
+
+    if enabled or (self.CP.carFingerprint == CAR.PREAP_MODELS):
+      ldw_haptic = 0
+      if left_lane_depart or right_lane_depart:
+        ldw_haptic = 1
+      can_sends.append(self.tesla_can.create_steering_control(apply_angle, enabled and not CS.human_control and not CS.out.cruiseState.standstill, ldw_haptic, CAN_EPAS[self.CP.carFingerprint], 1))
+
+
+    #update LONG Control module
+    can_messages = self.long_controller.update(enabled, CS, frame, actuators, cruise_cancel,pcm_speed,pcm_override, long_plan,radar_state)
+    if len(can_messages) > 0:
+      can_sends[0:0] = can_messages
+
+    #update HUD Integration module
+    can_messages = self.hud_controller.update(controls_state, enabled, CS, frame, actuators, cruise_cancel, hud_alert, audible_alert,
+            left_line, right_line, lead, left_lane_depart, right_lane_depart,CS.human_control,radar_state,CS.lat_plan,apply_angle,model_data)
+    if len(can_messages) > 0:
+      can_sends.extend(can_messages)
+
+    new_actuators = actuators.copy()
+    new_actuators.steeringAngleDeg = apply_angle
+    
     return new_actuators, can_sends
